@@ -1,0 +1,49 @@
+libhackrfk — Kotlin driver for the HackRF SDR (Android USB host)
+Copyright (C) 2026 Isak Ruas <isakruas@gmail.com>. All rights reserved.
+
+This library is DUAL-LICENSED:
+
+1. GPL grant (iSDR Drivers). As distributed as part of the "iSDR Drivers"
+   application (the GPL driver host for the iSDR app), this library is
+   licensed under the GNU General Public License, version 2 or (at your
+   option) any later version. A copy of the GPL accompanies that
+   distribution. This grant exists so the combined iSDR Drivers work can be
+   distributed in full compliance with the licenses of the drivers it
+   contains.
+
+2. All other uses. Any use outside the scope of grant (1) — including
+   linking this library, or a modified version of it, into any other
+   application — requires a separate written license from the copyright
+   holder. No such rights are granted by default.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+
+----------------------------------------------------------------------------
+
+This library is a Kotlin port of the reference host library libhackrf
+(https://github.com/greatscottgadgets/hackrf), which is licensed under the
+BSD 3-clause license. Its copyright notice is retained below, verbatim, as
+required by its terms:
+
+Copyright (c) 2012-2026 Great Scott Gadgets <info@greatscottgadgets.com>
+Copyright (c) 2012, Jared Boone <jared@sharebrained.com>
+Copyright (c) 2013, Benjamin Vernoux <titanmkd@gmail.com>
+
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without modification, are permitted provided that the following conditions are met:
+
+    Redistributions of source code must retain the above copyright notice, this list of conditions and the following disclaimer.
+    Redistributions in binary form must reproduce the above copyright notice, this list of conditions and the following disclaimer in the
+	documentation and/or other materials provided with the distribution.
+    Neither the name of Great Scott Gadgets nor the names of its contributors may be used to endorse or promote products derived from this software
+	without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO,
+THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
