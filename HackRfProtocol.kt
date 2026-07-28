@@ -62,6 +62,8 @@ object HackRfProtocol {
     // Operational extensions (reference hackrf.c; service/factory ops like
     // SPIFLASH/CPLD/FPGA are deliberately out of an app's scope):
     const val REQ_BOARD_PARTID_SERIALNO_READ = 18
+    /** SGPIO loop state on the M0 core (hackrf.c:1447, USB API 0x0106+). */
+    const val REQ_GET_M0_STATE = 41
     const val REQ_OPERACAKE_GET_BOARDS = 27
     const val REQ_OPERACAKE_SET_PORTS = 28
     const val REQ_RESET = 30
@@ -248,7 +250,124 @@ object HackRfProtocol {
     const val TX_BOARD_RATE = 2_400_000
     const val TX_UPSAMPLE = TX_BOARD_RATE / TX_INPUT_RATE
 
+    // ---- transmit pipeline sizing ------------------------------------------------
+    //
+    // Everything below is derived from the firmware's own numbers, because a
+    // transmit shortfall is not a soft failure on this board: the M0 SGPIO
+    // loop writes ZEROES to the DAC whenever the M4 hasn't advanced its count
+    // in time (firmware `hackrf_usb/sgpio_m0.s`, "In TX mode, zeroes are
+    // written to SGPIO"). A starved host therefore hard-gates the envelope at
+    // an audio rate, which on the air is broadband splatter — not a dropout.
+
+    /** Bulk-out block the firmware schedules at a time (usb_api_transceiver.c). */
+    const val USB_TRANSFER_SIZE = 0x4000
+
+    /** Sample buffer the firmware fills BEFORE enabling baseband streaming. */
+    const val USB_SAMP_BUFFER_SIZE = 0x8000
+
+    /** Bulk buffer kept in flight behind it. */
+    const val USB_BULK_BUFFER_SIZE = 0x8000
+
+    /**
+     * Total bytes the board can hold while transmitting — 64 KiB, which at
+     * [TX_BOARD_RATE] is only **13.65 ms**. That is the entire budget the host
+     * has to miss its deadline by, and it is why the transmit path is split
+     * into a render thread and a USB thread instead of doing both in series.
+     */
+    const val DEVICE_TX_BUFFER_BYTES = USB_SAMP_BUFFER_SIZE + USB_BULK_BUFFER_SIZE
+
+    /**
+     * Input pairs rendered per USB block. 256 × [TX_UPSAMPLE] × 2 = 25 600
+     * bytes — a whole number of 512-byte USB packets (so the stream never
+     * carries a short packet) and 5.33 ms of RF.
+     */
+    const val TX_BLOCK_PAIRS = 256
+    const val TX_BLOCK_BYTES = TX_BLOCK_PAIRS * TX_UPSAMPLE * 2
+
+    /**
+     * Rendered blocks kept in the pool. The reference host library keeps
+     * `TRANSFER_COUNT` = 4 transfers permanently queued on the endpoint
+     * (hackrf.c:144); this is the same idea with the same depth — the USB
+     * thread always has the next block ready the instant the previous one
+     * completes, so no per-block compute ever lands between transfers.
+     */
+    const val TX_BLOCKS_IN_FLIGHT = 4
+
+    /**
+     * Cushion of un-rendered 48 kSps pairs the driver aims to keep queued —
+     * 30 ms. The board consumes off its own TCXO while the host produces off
+     * the Android audio clock; without a cushion the queue sits at zero and
+     * roughly every other block is part silence.
+     */
+    const val TX_TARGET_PAIRS = 1_440
+
+    /**
+     * How far the cushion may stray (±10 ms) before the renderer drops or
+     * repeats a single pair to pull it back. One pair at 48 kSps is inaudible,
+     * and at most one correction per block it can track ±3900 ppm — orders of
+     * magnitude more than the two clocks will ever differ.
+     */
+    const val TX_SLACK_PAIRS = 480
+
+    /**
+     * When the queue genuinely runs dry, the last sample is faded out over
+     * this many pairs (1 ms) instead of stepping to zero. A step IS the
+     * splatter; a 1 ms raised edge is not.
+     */
+    const val TX_FADE_PAIRS = 48
+
+    // ---- M0 SGPIO loop state (hackrf.c hackrf_get_m0_state) ----------------------
+
+    /** Byte length of the `hackrf_m0_state` struct on the wire. */
+    const val M0_STATE_SIZE = 40
+
+    /**
+     * Decoded `hackrf_m0_state` (hackrf.h) — the board's own account of how
+     * well it was fed. [numShortfalls] staying put across a transmission is
+     * the proof that the host never starved the DAC.
+     */
+    data class M0State(
+        val requestedMode: Int,
+        val requestFlag: Int,
+        val activeMode: Int,
+        val m0Count: Int,
+        val m4Count: Int,
+        val numShortfalls: Int,
+        val longestShortfall: Int,
+        val shortfallLimit: Int,
+        val threshold: Int,
+        val nextMode: Int,
+        val error: Int,
+    )
+
+    /** Parse the 40-byte little-endian reply of [REQ_GET_M0_STATE]. */
+    fun parseM0State(buf: ByteArray): M0State? {
+        if (buf.size < M0_STATE_SIZE) return null
+        return M0State(
+            requestedMode = leShort(buf, 0),
+            requestFlag = leShort(buf, 2),
+            activeMode = leInt(buf, 4),
+            m0Count = leInt(buf, 8),
+            m4Count = leInt(buf, 12),
+            numShortfalls = leInt(buf, 16),
+            longestShortfall = leInt(buf, 20),
+            shortfallLimit = leInt(buf, 24),
+            threshold = leInt(buf, 28),
+            nextMode = leInt(buf, 32),
+            error = leInt(buf, 36),
+        )
+    }
+
     // ---- helpers ---------------------------------------------------------------
+
+    private fun leShort(src: ByteArray, offset: Int): Int =
+        (src[offset].toInt() and 0xFF) or ((src[offset + 1].toInt() and 0xFF) shl 8)
+
+    private fun leInt(src: ByteArray, offset: Int): Int =
+        (src[offset].toInt() and 0xFF) or
+            ((src[offset + 1].toInt() and 0xFF) shl 8) or
+            ((src[offset + 2].toInt() and 0xFF) shl 16) or
+            ((src[offset + 3].toInt() and 0xFF) shl 24)
 
     private fun putLeInt(dst: ByteArray, offset: Int, value: Int) {
         dst[offset] = (value and 0xFF).toByte()

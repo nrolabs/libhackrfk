@@ -31,8 +31,17 @@ import kotlin.math.sin
  */
 class TxInterpolator(
     private val factor: Int = HackRfProtocol.TX_UPSAMPLE,
-    private val tapsPerPhase: Int = 8,
+    private val tapsPerPhase: Int = TAPS_PER_PHASE,
 ) {
+    companion object {
+        /**
+         * Prototype taps per polyphase branch — also the depth of the input
+         * history, i.e. how many input samples of tail the output carries
+         * after the last non-zero sample.
+         */
+        const val TAPS_PER_PHASE = 8
+    }
+
     /** [factor] branches × [tapsPerPhase] taps of the prototype lowpass. */
     private val phases: Array<FloatArray>
 
