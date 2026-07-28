@@ -136,12 +136,13 @@ object HackRfProtocol {
     )
 
     /**
-     * hackrf_compute_baseband_filter_bw: the first table entry ≥ the request,
-     * rounded DOWN to the previous entry when strictly greater (unless the
-     * request is below the smallest entry). Requests beyond the table clamp to
-     * the widest filter (the reference walks onto its 0 sentinel there, which
-     * would program a nonsensical 0 Hz — sample-rate setting never reaches it,
-     * since it always asks for 75 % of ≤ 20 MHz).
+     * Computes the appropriate baseband filter bandwidth for a given requested bandwidth.
+     * Evaluates the first table entry ≥ the request, rounding down to the previous entry 
+     * if strictly greater. Clamps to the widest available filter if out of bounds.
+     * This avoids programming a nonsensical 0 Hz baseband filter.
+     *
+     * @param bandwidthHz The requested anti-alias bandwidth in Hz.
+     * @return The exact filter bandwidth in Hz to configure on the MAX2837.
      */
     fun basebandFilterFor(bandwidthHz: Int): Int {
         val idx = BASEBAND_FILTERS_HZ.indexOfFirst { it >= bandwidthHz }
@@ -161,7 +162,10 @@ object HackRfProtocol {
     /** LNA (IF) gain: 0–40 dB, 8 dB steps (hackrf.c masks with ~0x07). */
     fun lnaGainMasked(db: Int): Int = db.coerceIn(0, 40) and 0x07.inv()
 
-    /** VGA (baseband) gain: 0–62 dB, 2 dB steps (hackrf.c masks with ~0x01). */
+    /** 
+     * Calculates VGA (baseband) gain encoding. Range: 0–62 dB, 2 dB steps.
+     * Enforces the ~0x01 mask expected by the hardware.
+     */
     fun vgaGainMasked(db: Int): Int = db.coerceIn(0, 62) and 0x01.inv()
 
     /** TXVGA gain: 0–47 dB, 1 dB steps. */
@@ -227,10 +231,16 @@ object HackRfProtocol {
 
     // ---- sample conversion -----------------------------------------------------
 
-    /** Float [-1,1] → the board's signed 8-bit sample. */
+    /** 
+     * Converts a normalized Float [-1,1] continuous sample to the board's signed 8-bit discrete format. 
+     * Clamps values out of bounds to prevent integer overflow wraparound.
+     */
     fun toS8(v: Float): Byte = (v.coerceIn(-1f, 1f) * 127f).toInt().toByte()
 
-    /** The board's signed 8-bit sample → float in (-1,1]. */
+    /** 
+     * Converts the board's signed 8-bit discrete format to a normalized float in (-1,1].
+     * Divides by 128.0f to maintain consistent peak amplitudes.
+     */
     fun s8ToFloat(b: Byte): Float = b / 128.0f
 
     /** TX board rate and the exact-integer upsampling from the 48 k input. */
