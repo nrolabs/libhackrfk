@@ -102,7 +102,19 @@ class HackRfClient(
 
     /** RX sample rate to restore after a TX-over (half-duplex switch). */
     @Volatile private var rxSampleRate = 4_000_000
-    @Volatile private var currentFreqHz = 100_000_000L
+
+    /**
+     * RX and TX frequencies are tracked SEPARATELY even though the board has a
+     * single LO, because the host does not ask for the same one in both
+     * directions: it tunes the receiver deliberately off the operator's VFO to
+     * keep the wanted signal away from the zero-IF DC spike and corrects the
+     * offset in its own NCO, while the transmitter must put the carrier
+     * exactly on the VFO. Collapsing the two into one sticky value made the
+     * first transmission overwrite the receiver's tuning, so returning to RX
+     * came back offset by the guard — audible as a fixed dial error.
+     */
+    @Volatile private var rxFreqHz = 100_000_000L
+    @Volatile private var txFreqHz = 100_000_000L
 
     // Last front-end state, re-asserted after every transceiver-mode change:
     // the firmware drops the antenna bias power when returning through IDLE
@@ -222,12 +234,31 @@ class HackRfClient(
     // ==================== control requests ====================
 
     /**
-     * Retunes the local oscillator to the specified frequency. 
-     * Automatically resets the smoothing filter for the FFT to prevent cross-fading
-     * artifacts on screen. Supported range depends on the MAX2837/RFFC5072 limit (typically 1 MHz to 6 GHz).
+     * Retunes the receiver. Automatically resets the smoothing filter for the
+     * FFT to prevent cross-fading artifacts on screen. Supported range depends
+     * on the MAX2837/RFFC5072 limit (typically 1 MHz to 6 GHz).
+     *
+     * While keyed this only records the frequency: the single LO belongs to
+     * the transmitter until unkey, and [startRx] applies it on the way back.
      */
     fun setFrequency(hz: Long) {
-        currentFreqHz = hz
+        rxFreqHz = hz
+        if (transmitting) return
+        tuneTo(hz)
+    }
+
+    /**
+     * Retunes the transmitter. The host puts the carrier exactly here, with
+     * none of the receiver's zero-IF guard offset — see [rxFreqHz]. While
+     * receiving this only records the frequency; [setPtt] applies it on key.
+     */
+    fun setTxFrequency(hz: Long) {
+        txFreqHz = hz
+        if (!transmitting) return
+        tuneTo(hz)
+    }
+
+    private fun tuneTo(hz: Long) {
         vendorOut(HackRfProtocol.REQ_SET_FREQ, 0, 0, HackRfProtocol.freqParams(hz))
         fft?.resetSmoothing()
     }
@@ -283,7 +314,12 @@ class HackRfClient(
         vendorInByte(HackRfProtocol.REQ_SET_TXVGA_GAIN, 0, lastTxVgaGain)
     }
 
-    /** RF amplifier (~11-14 dB, shared by RX and TX). */
+    /**
+     * RF amplifier, shared by RX and TX: bypassed when off, ~11 dB when on
+     * (less at higher frequencies). Not 14 dB — that number is the MGA-81563's
+     * advertised OUTPUT POWER, not its gain, and the reference documentation
+     * calls the confusion out by name in `docs/source/setting_gain.rst`.
+     */
     fun setAmpEnable(on: Boolean) {
         lastAmpEnable = on
         vendorOut(HackRfProtocol.REQ_AMP_ENABLE, if (on) 1 else 0, 0, null)
@@ -369,7 +405,9 @@ class HackRfClient(
         if (!running || rxStarted || transmitting) return
         rxStarted = true
         reassertFrontEnd(forTx = false)
-        setFrequency(currentFreqHz)
+        // Back to the RECEIVER's frequency, which is not where the last
+        // transmission left the LO.
+        tuneTo(rxFreqHz)
         setTransceiverMode(HackRfProtocol.MODE_RECEIVE)
         rxThread = thread(name = "hackrf-rx") { rxLoop() }
     }
@@ -436,7 +474,7 @@ class HackRfClient(
             }
             sendSampleRate(HackRfProtocol.TX_BOARD_RATE)
             reassertFrontEnd(forTx = true)
-            setFrequency(currentFreqHz)
+            tuneTo(txFreqHz)
             // Baseline BEFORE keying: the M0 counter is cumulative, and asking
             // for it while the firmware is prefilling its sample buffer is
             // needless traffic on the one path that must not be disturbed.
