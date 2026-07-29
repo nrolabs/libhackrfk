@@ -546,7 +546,7 @@ class HackRfClient(
      */
     override fun setLnaGain(db: Int) {
         lastLnaGain = HackRfProtocol.lnaGainMasked(db)
-        vendorInByte(HackRfProtocol.REQ_SET_LNA_GAIN, 0, lastLnaGain)
+        vendorOut(HackRfProtocol.REQ_SET_LNA_GAIN, 0, lastLnaGain, null)
     }
 
     /**
@@ -555,7 +555,7 @@ class HackRfClient(
      */
     fun setVgaGain(db: Int) {
         lastVgaGain = HackRfProtocol.vgaGainMasked(db)
-        vendorInByte(HackRfProtocol.REQ_SET_VGA_GAIN, 0, lastVgaGain)
+        vendorOut(HackRfProtocol.REQ_SET_VGA_GAIN, 0, lastVgaGain, null)
     }
 
     /**
@@ -564,7 +564,7 @@ class HackRfClient(
      */
     fun setTxVgaGain(db: Int) {
         lastTxVgaGain = HackRfProtocol.txVgaGain(db)
-        vendorInByte(HackRfProtocol.REQ_SET_TXVGA_GAIN, 0, lastTxVgaGain)
+        vendorOut(HackRfProtocol.REQ_SET_TXVGA_GAIN, 0, lastTxVgaGain, null)
     }
 
     /**
@@ -858,10 +858,10 @@ class HackRfClient(
     /** Re-send the front-end state after a transceiver-mode change. */
     private fun reassertFrontEnd(forTx: Boolean) {
         if (forTx) {
-            vendorInByte(HackRfProtocol.REQ_SET_TXVGA_GAIN, 0, lastTxVgaGain)
+            vendorOut(HackRfProtocol.REQ_SET_TXVGA_GAIN, 0, lastTxVgaGain, null)
         } else {
-            vendorInByte(HackRfProtocol.REQ_SET_LNA_GAIN, 0, lastLnaGain)
-            vendorInByte(HackRfProtocol.REQ_SET_VGA_GAIN, 0, lastVgaGain)
+            vendorOut(HackRfProtocol.REQ_SET_LNA_GAIN, 0, lastLnaGain, null)
+            vendorOut(HackRfProtocol.REQ_SET_VGA_GAIN, 0, lastVgaGain, null)
         }
         vendorOut(HackRfProtocol.REQ_AMP_ENABLE, if (lastAmpEnable) 1 else 0, 0, null)
         vendorOut(
@@ -1247,18 +1247,6 @@ class HackRfClient(
             CONTROL_TIMEOUT_MS,
         )
         return if (r >= 0) buf.copyOf(r) else null
-    }
-
-    private fun vendorInByte(request: Int, value: Int, index: Int) = synchronized(controlLock) {
-        val conn = connection ?: return
-        val retval = ByteArray(1)
-        val r = conn.controlTransfer(
-            HackRfProtocol.TYPE_VENDOR_IN, request, value, index, retval, 1,
-            CONTROL_TIMEOUT_MS,
-        )
-        if (r != 1 || retval[0].toInt() == 0) {
-            Log.w(TAG, "vendor request $request rejected (r=$r)")
-        }
     }
 
     private suspend fun awaitPermission(usb: UsbManager, device: UsbDevice): Boolean {
