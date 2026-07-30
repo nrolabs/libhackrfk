@@ -66,10 +66,18 @@ import kotlinx.coroutines.suspendCancellableCoroutine
  * [txWriteLoop] asks for it. This is correctness, not optimisation.
  */
 class HackRfClient(
-    private val context: Context,
+    /** Null only under test, where no USB stack exists to connect through. */
+    private val context: Context?,
     /** (power spectrum in dB, interleaved IQ samples i0,q0,i1,q1,... in [-1,1]) */
     private val onDataReceived: (FloatArray, FloatArray) -> Unit,
     private val onConnectionStatusChanged: (Boolean, String) -> Unit,
+    /**
+     * Receive-gap telemetry: cumulative count of stream discontinuities
+     * (firmware shortfalls plus host-side ring drops) since RX started.
+     * Called from the RX processing thread, at most about once per second
+     * and only when the count changes.
+     */
+    private val onRxGaps: ((Long) -> Unit)? = null,
 ) : RadioClient, TransmitCapable, AntennaPowerCapable, AnalogFilterCapable, LnaGainCapable {
     companion object {
         private const val TAG = "HackRfClient"
@@ -91,14 +99,31 @@ class HackRfClient(
 
     private var connection: UsbDeviceConnection? = null
     private var iface: UsbInterface? = null
-    private var rxEndpoint: UsbEndpoint? = null
-    private var txEndpoint: UsbEndpoint? = null
+    @Volatile private var transport: HackRfTransport? = null
     @Volatile private var running = false
     @Volatile private var rxStarted = false
     @Volatile private var transmitting = false
-    private var rxThread: Thread? = null
+    /**
+     * True between PTT release and the moment the tail has actually left the
+     * board: new samples are refused, the renderer runs its unkey ramp and
+     * the mode switch waits for the DAC to drain. See [drainAndStopTx].
+     */
+    @Volatile private var txDraining = false
+    private var rxUsbThread: Thread? = null
+    private var rxDspThread: Thread? = null
     private var txRenderThread: Thread? = null
     private var txWriteThread: Thread? = null
+    @Volatile private var txRenderer: TxBlockRenderer? = null
+
+    // RX reassembly and gap accounting. The assembler carries every received
+    // byte across transfer boundaries (short and odd-length transfers
+    // included), so a hiccup on the wire can shift latency but never tear
+    // I/Q alignment or silently discard samples.
+    private val rxAssembler = RxAssembler()
+    /** Firmware shortfall counter at RX start, for the running delta. */
+    @Volatile private var rxStartShortfalls = -1
+    /** Cumulative RX gap count last published through [onRxGaps]. */
+    @Volatile private var lastReportedGaps = -1L
     private var fft: FFTProcessor? = null
     /** Bin count the current [fft] was built for. */
     @Volatile private var fftBins = 0
@@ -126,9 +151,9 @@ class HackRfClient(
     // the firmware drops the antenna bias power when returning through IDLE,
     // so it can never stay enabled across modes. Re-sending the gains costs
     // nothing and removes any ambiguity about what survived the switch.
-    @Volatile private var lastLnaGain = 16
-    @Volatile private var lastVgaGain = 20
-    @Volatile private var lastTxVgaGain = 0
+    @Volatile private var lastLnaGain = HackRfProtocol.DEFAULT_LNA_DB
+    @Volatile private var lastVgaGain = HackRfProtocol.DEFAULT_VGA_DB
+    @Volatile private var lastTxVgaGain = HackRfProtocol.DEFAULT_TXVGA_DB
     @Volatile private var lastAmpEnable = false
     @Volatile private var lastAntennaPower = false
 
@@ -262,7 +287,12 @@ class HackRfClient(
      * @return true if successfully connected and initialized, false otherwise.
      */
     override suspend fun connect(): Boolean {
-        val usb = context.getSystemService(Context.USB_SERVICE) as UsbManager
+        val ctx = context
+        if (ctx == null) {
+            onConnectionStatusChanged(false, "No USB context")
+            return false
+        }
+        val usb = ctx.getSystemService(Context.USB_SERVICE) as UsbManager
         val device = usb.deviceList.values
             .firstOrNull { findKnownDevice(it.vendorId, it.productId) }
         if (device == null) {
@@ -301,8 +331,7 @@ class HackRfClient(
         }
         connection = conn
         iface = itf
-        rxEndpoint = bulkIn
-        txEndpoint = bulkOut
+        transport = AndroidUsbTransport(conn, bulkIn, bulkOut)
         fftBins = HackRfProtocol.spectrumBinsFor(rxSampleRate)
         fft = FFTProcessor(fftBins)
         running = true
@@ -388,17 +417,20 @@ class HackRfClient(
         } catch (e: Exception) {
             Log.w(TAG, "could not park the transceiver on disconnect", e)
         }
-        rxThread?.join(1000)
-        rxThread = null
+        transport?.cancelRx()
+        rxAssembler.wake()
+        rxUsbThread?.join(1000)
+        rxUsbThread = null
+        rxDspThread?.join(1000)
+        rxDspThread = null
         sweepThread?.join(1000)
         sweepThread = null
         stopTxThreads()
+        transport = null
         iface?.let { connection?.releaseInterface(it) }
         connection?.close()
         connection = null
         iface = null
-        rxEndpoint = null
-        txEndpoint = null
         onConnectionStatusChanged(false, "Disconnected")
     }
 
@@ -480,6 +512,13 @@ class HackRfClient(
             fftBins = bins
             fft = FFTProcessor(bins)
         }
+        // Deferred while keyed or sweeping, same semantics as setFrequency:
+        // while transmitting the converters are clocked at the TX rate, and
+        // reprogramming them mid-over shifts the whole transmitted spectrum
+        // on the air; during a sweep the firmware owns the rate it was
+        // initialised with. The recorded value is applied on the way back to
+        // RX (setPtt/stopSweep both re-send it).
+        if (transmitting || sweeping) return
         sendSampleRate(hz)
     }
 
@@ -520,6 +559,12 @@ class HackRfClient(
 
     fun setBasebandFilterBandwidth(hz: Int) {
         manualFilterHz = hz.coerceAtLeast(0)
+        // Deferred while keyed or sweeping, for the same reason as the
+        // sample rate: the analog filter is shared by both directions, and
+        // narrowing it under a live transmission clips the signal being
+        // radiated. sendSampleRate re-asserts the filter when RX resumes,
+        // so the recorded choice is never lost.
+        if (transmitting || sweeping) return
         val bw = if (manualFilterHz > 0) {
             HackRfProtocol.basebandFilterFor(manualFilterHz)
         } else {
@@ -541,30 +586,51 @@ class HackRfClient(
     }
 
     /**
+     * Gain requests are the one control family the firmware answers with a
+     * DATA STAGE: a vendor IN transfer whose single payload byte is the
+     * accept/reject verdict. Sending them as OUT with no data stage is a
+     * direction mismatch — the firmware queues a 1-byte IN response the host
+     * never reads, and the rejection verdict is silently lost, so a refused
+     * gain leaves the host believing a value the hardware never applied.
+     *
+     * @return true when the firmware confirmed the gain.
+     */
+    private fun sendGain(request: Int, gain: Int): Boolean {
+        val status = vendorIn(request, 0, gain, 1)
+        val ok = status != null && status.size == 1 && status[0].toInt() != 0
+        if (!ok) Log.w(TAG, "gain request $request value $gain rejected by firmware")
+        return ok
+    }
+
+    /**
      * Sets the LNA (IF) gain. Range: 0-40 dB in 8 dB steps.
      * Affects only RX path. The firmware masks invalid values to the closest step.
      */
     override fun setLnaGain(db: Int) {
         lastLnaGain = HackRfProtocol.lnaGainMasked(db)
-        vendorOut(HackRfProtocol.REQ_SET_LNA_GAIN, 0, lastLnaGain, null)
+        sendGain(HackRfProtocol.REQ_SET_LNA_GAIN, lastLnaGain)
     }
 
     /**
      * Sets the VGA (baseband) gain. Range: 0-62 dB in 2 dB steps.
      * Affects only RX path. Valid values are strictly enforced by the protocol mask.
+     *
+     * @return false when the firmware refused the value.
      */
-    fun setVgaGain(db: Int) {
+    fun setVgaGain(db: Int): Boolean {
         lastVgaGain = HackRfProtocol.vgaGainMasked(db)
-        vendorOut(HackRfProtocol.REQ_SET_VGA_GAIN, 0, lastVgaGain, null)
+        return sendGain(HackRfProtocol.REQ_SET_VGA_GAIN, lastVgaGain)
     }
 
     /**
      * Sets the transmit VGA gain. Range: 0-47 dB in 1 dB steps.
      * Governs the TX power prior to the RF amplifier.
+     *
+     * @return false when the firmware refused the value.
      */
-    fun setTxVgaGain(db: Int) {
+    fun setTxVgaGain(db: Int): Boolean {
         lastTxVgaGain = HackRfProtocol.txVgaGain(db)
-        vendorOut(HackRfProtocol.REQ_SET_TXVGA_GAIN, 0, lastTxVgaGain, null)
+        return sendGain(HackRfProtocol.REQ_SET_TXVGA_GAIN, lastTxVgaGain)
     }
 
     /**
@@ -858,10 +924,10 @@ class HackRfClient(
     /** Re-send the front-end state after a transceiver-mode change. */
     private fun reassertFrontEnd(forTx: Boolean) {
         if (forTx) {
-            vendorOut(HackRfProtocol.REQ_SET_TXVGA_GAIN, 0, lastTxVgaGain, null)
+            sendGain(HackRfProtocol.REQ_SET_TXVGA_GAIN, lastTxVgaGain)
         } else {
-            vendorOut(HackRfProtocol.REQ_SET_LNA_GAIN, 0, lastLnaGain, null)
-            vendorOut(HackRfProtocol.REQ_SET_VGA_GAIN, 0, lastVgaGain, null)
+            sendGain(HackRfProtocol.REQ_SET_LNA_GAIN, lastLnaGain)
+            sendGain(HackRfProtocol.REQ_SET_VGA_GAIN, lastVgaGain)
         }
         vendorOut(HackRfProtocol.REQ_AMP_ENABLE, if (lastAmpEnable) 1 else 0, 0, null)
         vendorOut(
@@ -885,46 +951,89 @@ class HackRfClient(
         // override, if one is in force.
         applyRxTuning()
         setTransceiverMode(HackRfProtocol.MODE_RECEIVE)
-        rxThread = thread(name = "hackrf-rx") { rxLoop() }
+        rxAssembler.reset()
+        lastReportedGaps = -1L
+        // Baseline for the firmware's overrun counter: it is cumulative
+        // across the board's whole uptime, so only the delta from here
+        // belongs to this receive session.
+        rxStartShortfalls = m0State()?.numShortfalls ?: -1
+        // Two threads, mirroring the transmit path. The USB thread does
+        // nothing but keep bulk-IN requests posted; every cycle it would
+        // have spent on conversion or an FFT is a window with no posted
+        // buffer, which at 20 MSps is a silent overrun inside the firmware.
+        rxDspThread = thread(name = "hackrf-rx-dsp") { rxDspLoop() }
+        rxUsbThread = thread(name = "hackrf-rx-usb") { rxUsbLoop() }
     }
 
     private fun stopRx() {
         rxStarted = false
-        rxThread?.join(1000)
-        rxThread = null
+        transport?.cancelRx()
+        rxAssembler.wake()
+        rxUsbThread?.join(1000)
+        rxUsbThread = null
+        rxDspThread?.join(1000)
+        rxDspThread = null
     }
 
-    private fun rxLoop() {
-        // Audio priority: block delivery must not lose CPU to rendering.
+    /**
+     * USB side of the receive stream: keep [HackRfProtocol.RX_REQUESTS_IN_FLIGHT]
+     * transfers posted and shovel every completed one into the assembler.
+     * Short and odd-length transfers are fed as-is — the assembler carries
+     * the residue, so no byte is ever discarded and I/Q parity survives.
+     */
+    private fun rxUsbLoop() {
         urgentAudioPriority()
-        val ep = rxEndpoint ?: return
-        val buffer = ByteArray(16 * 1024) // reduced from 128KB to prevent JNI GC lock stalls
+        val t = transport ?: return
+        t.rxStream(
+            HackRfProtocol.RX_TRANSFER_BYTES,
+            HackRfProtocol.RX_REQUESTS_IN_FLIGHT,
+            { running && rxStarted },
+        ) { bytes, n -> rxAssembler.feed(bytes, n) }
+    }
+
+    /**
+     * DSP side: fixed-size float blocks out of the assembler, spectrum on a
+     * throttle, gap telemetry on a slower one. All arrays are reused — the
+     * only steady-state allocation is the spectrum the FFT itself returns.
+     */
+    private fun rxDspLoop() {
+        val iq = FloatArray(HackRfProtocol.RX_BLOCK_PAIRS * 2)
         var lastFftMs = 0L
+        var lastGapPollMs = 0L
         while (running && rxStarted) {
-            val conn = connection ?: break
-            val n = conn.bulkTransfer(ep, buffer, buffer.size, BULK_TIMEOUT_MS)
-            if (n <= 0) continue
-            val pairs = n / 2
-            if (pairs < 256) continue
-            /* signed 8-bit interleaved IQ → interleaved floats in [-1, 1] */
-            val iq = FloatArray(pairs * 2)
-            for (i in 0 until pairs * 2) {
-                iq[i] = HackRfProtocol.s8ToFloat(buffer[i])
-            }
-            if (!spectrumEnabled) {
-                onDataReceived(EMPTY_SPECTRUM, iq)
-                continue
-            }
+            if (!rxAssembler.awaitBlock(iq, 100)) continue
             val now = System.currentTimeMillis()
-            if (now - lastFftMs >= 80) {
+            if (spectrumEnabled && now - lastFftMs >= 80) {
                 lastFftMs = now
-                val spectrum = fft?.computePowerSpectrum(iq, pairs)
-                if (spectrum != null) {
-                    onDataReceived(spectrum, iq)
-                    continue
-                }
+                val spectrum = fft?.computePowerSpectrum(iq, HackRfProtocol.RX_BLOCK_PAIRS)
+                onDataReceived(spectrum ?: EMPTY_SPECTRUM, iq)
+            } else {
+                onDataReceived(EMPTY_SPECTRUM, iq)
             }
-            onDataReceived(EMPTY_SPECTRUM, iq)
+            if (now - lastGapPollMs >= 1000) {
+                lastGapPollMs = now
+                publishRxGaps()
+            }
+        }
+    }
+
+    /**
+     * Fold the firmware's own overrun counter into the host-side drop count
+     * and publish the total when it moved. The M0 counter is the only
+     * witness to samples lost INSIDE the board (bus stalls, host scheduling)
+     * — the stream itself shows nothing at the point of the loss.
+     */
+    private fun publishRxGaps() {
+        val cb = onRxGaps ?: return
+        var gaps = rxAssembler.dropEvents
+        val base = rxStartShortfalls
+        if (base >= 0) {
+            val now = m0State()?.numShortfalls
+            if (now != null && now >= base) gaps += (now - base).toLong()
+        }
+        if (gaps != lastReportedGaps) {
+            lastReportedGaps = gaps
+            cb(gaps)
         }
     }
 
@@ -940,6 +1049,7 @@ class HackRfClient(
      */
     override fun setPtt(on: Boolean) {
         if (!running || on == transmitting) return
+        if (!on && txDraining) return // unkey already in progress
         // Transmitting while the board is sweeping means both a mode fight and
         // two owners of the stream; the sweep has to be stopped first.
         if (on && sweeping) {
@@ -972,10 +1082,64 @@ class HackRfClient(
             txWriteThread = thread(name = "hackrf-tx-usb") { txWriteLoop() }
             txRenderThread = thread(name = "hackrf-tx-render") { txRenderLoop() }
         } else {
-            stopTxThreads()
+            drainAndStopTx()
             reportShortfalls()
             sendSampleRate(rxSampleRate)
             startRx()
+        }
+    }
+
+    /**
+     * Unkey without a key click. Killing the transmit threads at the instant
+     * of PTT release truncated the envelope mid-sample — every over ended in
+     * a step, radiated as a wideband transient. Instead: stop accepting new
+     * audio, let the renderer drain what remains under a short fade-out ramp
+     * ([HackRfProtocol.TX_UNKEY_FADE_PAIRS]), then wait for the board's own
+     * consumption counter to catch up with what was sent, so the mode switch
+     * happens over a DAC that is genuinely at zero. Every wait is bounded by
+     * [HackRfProtocol.TX_UNKEY_TIMEOUT_MS]: a board that stops answering
+     * must never leave the transmitter hung keyed.
+     */
+    private fun drainAndStopTx() {
+        txDraining = true
+        try {
+            val deadline = System.currentTimeMillis() + HackRfProtocol.TX_UNKEY_TIMEOUT_MS
+            val renderer = txRenderer
+            renderer?.beginUnkey()
+            // Phase 1: the render thread keeps producing blocks until the
+            // ramp has fully reached zero (it drains the queue underneath).
+            while (renderer != null && !renderer.unkeyComplete &&
+                running && System.currentTimeMillis() < deadline
+            ) {
+                sleepQuietly(2)
+            }
+            // Phase 2: let the USB thread flush the already-rendered tail,
+            // then wait for the board to consume its buffered bytes. The M0
+            // count is the DAC's own read pointer; when it stops advancing
+            // the air is actually silent, not merely our queue.
+            while (running && txReady.isNotEmpty() &&
+                System.currentTimeMillis() < deadline
+            ) {
+                sleepQuietly(2)
+            }
+            var lastCount = -1
+            while (running && System.currentTimeMillis() < deadline) {
+                val count = m0State()?.m0Count ?: break
+                if (count == lastCount) break
+                lastCount = count
+                sleepQuietly(5)
+            }
+        } finally {
+            stopTxThreads()
+            txDraining = false
+        }
+    }
+
+    private fun sleepQuietly(ms: Long) {
+        try {
+            Thread.sleep(ms)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
         }
     }
 
@@ -985,12 +1149,17 @@ class HackRfClient(
         txRenderThread = null
         txWriteThread?.join(1000)
         txWriteThread = null
+        txRenderer = null
     }
 
     override fun isTransmitting(): Boolean = transmitting
 
     /** Queue interleaved 48 kS/s float IQ for transmission (drop-oldest). */
     override fun submitTxIq(iq: FloatArray) {
+        // After PTT release only the tail already queued may go to air; new
+        // audio arriving during the drain would extend the transmission past
+        // the operator's unkey.
+        if (txDraining) return
         synchronized(txLock) { txQueue.write(iq) }   // ring drops oldest itself
     }
 
@@ -1014,6 +1183,7 @@ class HackRfClient(
         urgentAudioPriority()
         val renderer = TxBlockRenderer()
         renderer.reset()
+        txRenderer = renderer
         awaitPrefill()
         while (running && transmitting) {
             val out = txFree.poll(100, TimeUnit.MILLISECONDS) ?: continue
@@ -1059,19 +1229,13 @@ class HackRfClient(
      */
     private fun txWriteLoop() {
         urgentAudioPriority()
-        val ep = txEndpoint ?: return
+        val t = transport ?: return
+        if (!t.hasTxEndpoint) return
         while (running && transmitting) {
             val block = txReady.poll(100, TimeUnit.MILLISECONDS) ?: continue
-            val conn = connection
-            if (conn == null) {
-                txFree.offer(block)
-                break
-            }
             var offset = 0
             while (offset < block.size && running && transmitting) {
-                val w = conn.bulkTransfer(
-                    ep, block, offset, block.size - offset, BULK_TIMEOUT_MS,
-                )
+                val w = t.bulkWrite(block, offset, block.size - offset, BULK_TIMEOUT_MS)
                 if (w < 0) break
                 offset += w
             }
@@ -1175,13 +1339,20 @@ class HackRfClient(
      * samples over as floats.
      */
     private fun sweepLoop(onSweepBlock: (Long, FloatArray) -> Unit) {
-        val ep = rxEndpoint ?: return
+        // Same deal as the RX loop: losing CPU to rendering while blocks
+        // arrive back-to-back is an overrun on the board's side.
+        urgentAudioPriority()
+        val t = transport ?: return
         val block = ByteArray(HackRfProtocol.SWEEP_BLOCK_SIZE)
         var filled = 0
         val chunk = ByteArray(HackRfProtocol.SWEEP_BLOCK_SIZE)
+        // One reusable output array: block size is fixed for the whole
+        // sweep, so per-block allocation was pure GC pressure on a loop that
+        // must keep pace with the bus.
+        val pairs = (HackRfProtocol.SWEEP_BLOCK_SIZE - HackRfProtocol.SWEEP_HEADER_SIZE) / 2
+        val iq = FloatArray(pairs * 2)
         while (running && sweeping) {
-            val conn = connection ?: break
-            val n = conn.bulkTransfer(ep, chunk, chunk.size, BULK_TIMEOUT_MS)
+            val n = t.bulkRead(chunk, chunk.size, BULK_TIMEOUT_MS)
             if (n <= 0) continue
             var consumed = 0
             while (consumed < n) {
@@ -1191,24 +1362,28 @@ class HackRfClient(
                 filled += take
                 if (filled < block.size) continue
                 filled = 0
-                if (!HackRfProtocol.isSweepBlock(block, 0)) {
-                    // Lost sync: hunt for the next marker inside this block.
+                if (!HackRfProtocol.sweepHeaderPlausible(block, 0)) {
+                    // Lost sync: hunt for the next header inside this block.
+                    // The 0x7F 0x7F marker alone is NOT a safe re-lock
+                    // target — 0x7F is also a positive full-scale sample, so
+                    // saturated captures contain the marker in the data
+                    // itself and a bare-marker hunt shifts every following
+                    // block by a constant error. A candidate only counts
+                    // when its full header parses to a frequency the
+                    // synthesiser can produce.
                     var sync = 1
-                    while (sync < block.size - 1 &&
-                        !(block[sync] == HackRfProtocol.SWEEP_MAGIC_0 &&
-                            block[sync + 1] == HackRfProtocol.SWEEP_MAGIC_1)
+                    while (sync <= block.size - HackRfProtocol.SWEEP_HEADER_SIZE &&
+                        !HackRfProtocol.sweepHeaderPlausible(block, sync)
                     ) {
                         sync++
                     }
-                    if (sync < block.size - 1) {
+                    if (sync <= block.size - HackRfProtocol.SWEEP_HEADER_SIZE) {
                         System.arraycopy(block, sync, block, 0, block.size - sync)
                         filled = block.size - sync
                     }
                     continue
                 }
                 val freqHz = HackRfProtocol.sweepBlockFreqHz(block, 0)
-                val pairs = (block.size - HackRfProtocol.SWEEP_HEADER_SIZE) / 2
-                val iq = FloatArray(pairs * 2)
                 for (i in 0 until pairs * 2) {
                     iq[i] = HackRfProtocol.s8ToFloat(
                         block[HackRfProtocol.SWEEP_HEADER_SIZE + i]
@@ -1230,8 +1405,8 @@ class HackRfClient(
     private val controlLock = Any()
 
     private fun vendorOut(request: Int, value: Int, index: Int, data: ByteArray?) = synchronized(controlLock) {
-        val conn = connection ?: return
-        val r = conn.controlTransfer(
+        val t = transport ?: return
+        val r = t.controlTransfer(
             HackRfProtocol.TYPE_VENDOR_OUT, request, value, index, data,
             data?.size ?: 0, CONTROL_TIMEOUT_MS,
         )
@@ -1240,22 +1415,47 @@ class HackRfClient(
 
     /** Generic vendor IN read; returns the received bytes or null on failure. */
     private fun vendorIn(request: Int, value: Int, index: Int, length: Int): ByteArray? = synchronized(controlLock) {
-        val conn = connection ?: return null
+        val t = transport ?: return null
         val buf = ByteArray(length)
-        val r = conn.controlTransfer(
+        val r = t.controlTransfer(
             HackRfProtocol.TYPE_VENDOR_IN, request, value, index, buf, length,
             CONTROL_TIMEOUT_MS,
         )
         return if (r >= 0) buf.copyOf(r) else null
     }
 
+    // ==================== test seam ====================
+
+    /**
+     * Wire a fake transport in place of a USB device, for JVM tests only:
+     * everything above the [HackRfTransport] boundary — state guards, gain
+     * status handling, stream reassembly, the unkey drain — runs exactly the
+     * production code path, minus the hardware.
+     */
+    internal fun attachTransportForTest(t: HackRfTransport) {
+        transport = t
+        running = true
+        fftBins = HackRfProtocol.spectrumBinsFor(rxSampleRate)
+        fft = FFTProcessor(fftBins)
+    }
+
+    /** Test visibility into the deferred-state guards. */
+    internal fun forceTransmittingForTest(on: Boolean) {
+        transmitting = on
+    }
+
+    internal fun forceSweepingForTest(on: Boolean) {
+        sweeping = on
+    }
+
     private suspend fun awaitPermission(usb: UsbManager, device: UsbDevice): Boolean {
+        val appCtx = context ?: return false
         if (usb.hasPermission(device)) return true
         return suspendCancellableCoroutine { cont ->
             val receiver = object : BroadcastReceiver() {
                 override fun onReceive(ctx: Context, intent: Intent) {
                     try {
-                        context.unregisterReceiver(this)
+                        appCtx.unregisterReceiver(this)
                     } catch (_: Exception) {
                     }
                     if (cont.isActive) {
@@ -1266,7 +1466,7 @@ class HackRfClient(
                 }
             }
             androidx.core.content.ContextCompat.registerReceiver(
-                context, receiver, IntentFilter(PERMISSION_ACTION),
+                appCtx, receiver, IntentFilter(PERMISSION_ACTION),
                 androidx.core.content.ContextCompat.RECEIVER_NOT_EXPORTED,
             )
             val flags =
@@ -1278,13 +1478,13 @@ class HackRfClient(
             usb.requestPermission(
                 device,
                 PendingIntent.getBroadcast(
-                    context, 0,
-                    Intent(PERMISSION_ACTION).setPackage(context.packageName), flags,
+                    appCtx, 0,
+                    Intent(PERMISSION_ACTION).setPackage(appCtx.packageName), flags,
                 ),
             )
             cont.invokeOnCancellation {
                 try {
-                    context.unregisterReceiver(receiver)
+                    appCtx.unregisterReceiver(receiver)
                 } catch (_: Exception) {
                 }
             }

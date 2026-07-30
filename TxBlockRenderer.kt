@@ -55,6 +55,12 @@ class TxBlockRenderer(
     private var lastQ = 0f
     private var starve = 0
 
+    // Unkey ramp state: -1 while keyed, counts down from [unkeyRampPairs]
+    // to 0 once beginUnkey() is called. Volatile because unkey is requested
+    // from the control thread while render() runs on the render thread.
+    @Volatile private var unkeyRemaining = -1
+    private var unkeyRampPairs = HackRfProtocol.TX_UNKEY_FADE_PAIRS
+
     /** Pairs the board was fed from a dry queue (fade or silence). */
     var starvedPairs = 0L
         private set
@@ -79,7 +85,24 @@ class TxBlockRenderer(
         starvedPairs = 0
         trimmedPairs = 0
         heldPairs = 0
+        unkeyRemaining = -1
     }
+
+    /**
+     * Begin the unkey ramp: from the next rendered pair on, output is
+     * multiplied by a linear fade to zero over [rampPairs] pairs, draining
+     * whatever the queue still holds under it. The step this replaces is the
+     * classic key click — an envelope discontinuity radiated as a wideband
+     * transient at every release of PTT. Idempotent while a ramp is running.
+     */
+    fun beginUnkey(rampPairs: Int = HackRfProtocol.TX_UNKEY_FADE_PAIRS) {
+        if (unkeyRemaining >= 0) return
+        unkeyRampPairs = rampPairs.coerceAtLeast(1)
+        unkeyRemaining = unkeyRampPairs
+    }
+
+    /** True once the unkey ramp has fully reached zero (only zeros follow). */
+    val unkeyComplete: Boolean get() = unkeyRemaining == 0
 
     /**
      * Take up to one block of pairs out of [queue], applying the cushion
@@ -118,8 +141,8 @@ class TxBlockRenderer(
     fun render(got: Int, out: ByteArray) {
         var n = 0
         for (p in 0 until blockPairs) {
-            val i: Float
-            val q: Float
+            var i: Float
+            var q: Float
             if (p < got) {
                 i = inBuf[p * 2]
                 q = inBuf[p * 2 + 1]
@@ -132,6 +155,16 @@ class TxBlockRenderer(
                 val g = if (starve >= fadePairs) 0f else 1f - starve.toFloat() / fadePairs
                 i = lastI * g
                 q = lastQ * g
+            }
+            // Unkey ramp on top of whatever the pair already is (live audio,
+            // starvation fade or silence): a single multiply keeps the two
+            // fades composable and the envelope monotonic to zero.
+            val remaining = unkeyRemaining
+            if (remaining >= 0) {
+                val g = if (remaining == 0) 0f else remaining.toFloat() / unkeyRampPairs
+                i *= g
+                q *= g
+                if (remaining > 0) unkeyRemaining = remaining - 1
             }
             interp.process(i, q, upsampled, 0)
             for (v in upsampled) out[n++] = HackRfProtocol.toS8(v)

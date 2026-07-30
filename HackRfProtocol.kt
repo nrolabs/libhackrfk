@@ -679,6 +679,32 @@ object HackRfProtocol {
         buf.size >= offset + SWEEP_HEADER_SIZE &&
             buf[offset] == SWEEP_MAGIC_0 && buf[offset + 1] == SWEEP_MAGIC_1
 
+    /**
+     * Highest frequency the sweep firmware will ever stamp into a block
+     * header (the synthesiser's upper limit plus the widest sample-rate
+     * offset). Used to validate a candidate header during resync.
+     */
+    const val SWEEP_FREQ_MAX_HZ = 7_300_000_000L
+
+    /**
+     * True when a FULL sweep header starts at [offset]: the 0x7F 0x7F marker
+     * AND a tuned frequency the hardware can actually produce.
+     *
+     * The marker alone is not enough for resync. 0x7F is also the code of a
+     * positive full-scale sample, so a saturated capture contains runs of
+     * 0x7F 0x7F in the sample data itself; re-locking on one of those shifts
+     * every subsequent block by a constant offset and mis-labels the whole
+     * sweep. The frequency field is the discriminator: sample bytes
+     * interpreted as a u64 are effectively random and land outside the
+     * synthesiser's range with overwhelming probability, while a genuine
+     * header always lands inside it.
+     */
+    fun sweepHeaderPlausible(buf: ByteArray, offset: Int): Boolean {
+        if (!isSweepBlock(buf, offset)) return false
+        val f = sweepBlockFreqHz(buf, offset)
+        return f in 0..SWEEP_FREQ_MAX_HZ
+    }
+
     /** Tuned frequency of the sweep block at [offset]: u64 little-endian Hz. */
     fun sweepBlockFreqHz(buf: ByteArray, offset: Int): Long {
         var v = 0L
@@ -706,17 +732,63 @@ object HackRfProtocol {
 
     // ---- sample conversion -----------------------------------------------------
 
-    /** 
-     * Converts a normalized Float [-1,1] continuous sample to the board's signed 8-bit discrete format. 
-     * Clamps values out of bounds to prevent integer overflow wraparound.
+    /**
+     * Converts a normalized Float [-1,1] continuous sample to the board's
+     * signed 8-bit discrete format. Clamps out-of-range values to prevent
+     * wraparound, then ROUNDS to the nearest code: truncation toward zero
+     * biases every sample by up to half an LSB in the direction of zero,
+     * which is a dead zone around the origin and measurable extra
+     * quantization noise on a transmit chain that only has 8 bits to begin
+     * with.
+     *
+     * The scale is deliberately asymmetric with [s8ToFloat]: outgoing samples
+     * use x127 so that +1.0 and -1.0 both map to representable codes
+     * (+127/-127, never overflowing to -128), while incoming samples use
+     * /128 so the ADC's full code range, including -128, stays inside
+     * [-1, 1). The 0.07 dB scale difference is far below the converters'
+     * own accuracy.
      */
-    fun toS8(v: Float): Byte = (v.coerceIn(-1f, 1f) * 127f).toInt().toByte()
+    fun toS8(v: Float): Byte = Math.round(v.coerceIn(-1f, 1f) * 127f).toByte()
 
-    /** 
+    /**
      * Converts the board's signed 8-bit discrete format to a normalized float in (-1,1].
      * Divides by 128.0f to maintain consistent peak amplitudes.
      */
     fun s8ToFloat(b: Byte): Float = b / 128.0f
+
+    // ---- receive pipeline sizing -------------------------------------------------
+    //
+    // The receive path mirrors the transmit split: a USB thread that does
+    // nothing but keep bulk-IN requests posted, and a DSP thread that
+    // converts and transforms. At 20 MSps the firmware produces 40 MB/s; any
+    // window during which no IN request is posted is an overrun on the
+    // board's side, and the firmware reports it only as a counter — the
+    // stream itself just silently loses samples and breaks phase continuity.
+
+    /** Bulk-IN transfer size per posted request (a multiple of 512). */
+    const val RX_TRANSFER_BYTES = 131_072
+
+    /**
+     * IN requests kept posted at all times. With four in flight the host
+     * controller always owns a buffer to DMA into while the CPU services a
+     * completion, so a scheduling hiccup on the USB thread shorter than
+     * three transfer times costs nothing.
+     */
+    const val RX_REQUESTS_IN_FLIGHT = 4
+
+    /**
+     * Pairs per block handed to the DSP thread: large enough to feed the
+     * widest FFT ([spectrumBinsFor] tops out at 4096) from a single block,
+     * small enough to stay under a millisecond of latency at the low rates.
+     */
+    const val RX_BLOCK_PAIRS = 8_192
+
+    /**
+     * Byte ring between the USB thread and the DSP thread — 1 MiB, about
+     * 26 ms at the maximum rate. Sized so a garbage-collection pause on the
+     * DSP side is absorbed instead of forcing the USB thread to drop.
+     */
+    const val RX_RING_BYTES = 1 shl 20
 
     /** TX board rate and the exact-integer upsampling from the 48 k input. */
     const val TX_INPUT_RATE = 48_000
@@ -785,6 +857,35 @@ object HackRfProtocol {
      * splatter; a 1 ms raised edge is not.
      */
     const val TX_FADE_PAIRS = 48
+
+    /**
+     * Unkey ramp: when PTT is released the renderer keeps draining whatever
+     * the queue still holds, multiplied by a linear ramp to zero over this
+     * many pairs (10 ms). Cutting the stream at the instant of unkey ends
+     * every over in an envelope step — a key click radiated on the air —
+     * while 10 ms bounds how long unkey can take regardless of queue depth.
+     */
+    const val TX_UNKEY_FADE_PAIRS = 480
+
+    /**
+     * Ceiling on the whole unkey sequence (ramp + board buffer drain +
+     * control traffic). If the board stops confirming consumption the
+     * transmitter is torn down anyway: a stuck unkey must never hold PTT.
+     */
+    const val TX_UNKEY_TIMEOUT_MS = 400L
+
+    // ---- driver-side front-end defaults ------------------------------------------
+
+    /**
+     * Gains asserted before the operator touches anything, kept in ONE place
+     * so the value re-sent after every transceiver-mode change is the same
+     * one used at connect. Moderate RX gain (front end alive but not
+     * saturating on a typical antenna) and zero TX drive (never radiate more
+     * than asked).
+     */
+    const val DEFAULT_LNA_DB = 16
+    const val DEFAULT_VGA_DB = 20
+    const val DEFAULT_TXVGA_DB = 0
 
     // ---- sample-transfer loop state ---------------------------------------------
 
