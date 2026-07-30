@@ -1325,7 +1325,20 @@ class HackRfClient(
     fun stopSweep() {
         if (!sweeping) return
         sweeping = false
-        sweepThread?.join(1000)
+        // The sweep loop can be parked in a 500 ms bulk read or a slow
+        // downstream callback; starting RX while it still owns the bulk-IN
+        // endpoint would interleave two readers on one pipe. Wait it out —
+        // and if it truly will not die, stay stopped rather than corrupt
+        // the stream.
+        val t = sweepThread
+        if (t != null) {
+            t.join(3000)
+            if (t.isAlive) {
+                Log.w(TAG, "sweep thread did not stop; leaving rx down")
+                sweepThread = null
+                return
+            }
+        }
         sweepThread = null
         sendSampleRate(rxSampleRate)
         startRx()

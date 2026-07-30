@@ -88,6 +88,7 @@ class AndroidUsbTransport(
         const val SYNC_TIMEOUT_MS = 500
         const val DRAIN_WAIT_MS = 50L
         const val DRAIN_BUDGET_MS = 500L
+        const val SYNC_ERROR_LIMIT = 8
     }
 
     @Volatile private var rxCancelled = false
@@ -222,9 +223,21 @@ class AndroidUsbTransport(
 
     private fun rxStreamSync(keepGoing: () -> Boolean, onBytes: (ByteArray, Int) -> Unit) {
         val buffer = ByteArray(SYNC_READ_BYTES)
+        var consecutiveErrors = 0
         while (keepGoing() && !rxCancelled) {
             val n = conn.bulkTransfer(rxEndpoint, buffer, buffer.size, SYNC_TIMEOUT_MS)
-            if (n > 0) onBytes(buffer, n)
+            if (n > 0) {
+                onBytes(buffer, n)
+                consecutiveErrors = 0
+            } else if (n < 0) {
+                // A removed device fails instantly (no timeout wait): without
+                // a break this loop spins a core at 100% until the caller
+                // notices by some other path.
+                if (++consecutiveErrors >= SYNC_ERROR_LIMIT) {
+                    Log.w(TAG, "bulk-IN failing repeatedly, stopping rx stream")
+                    break
+                }
+            }
         }
     }
 
