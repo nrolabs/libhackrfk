@@ -86,6 +86,8 @@ class AndroidUsbTransport(
         const val WAIT_TIMEOUT_MS = 250L
         const val SYNC_READ_BYTES = 16 * 1024
         const val SYNC_TIMEOUT_MS = 500
+        const val DRAIN_WAIT_MS = 50L
+        const val DRAIN_BUDGET_MS = 500L
     }
 
     @Volatile private var rxCancelled = false
@@ -192,8 +194,27 @@ class AndroidUsbTransport(
                         it.cancel()
                     } catch (_: Exception) {
                     }
-                    it.close()
                 }
+                // DRAIN before closing: a cancelled or completed request stays
+                // in the connection's completion queue until requestWait
+                // dequeues it. Closing first leaves a stale native entry that
+                // the NEXT rx session's requestWait dequeues — a closed
+                // request (endpoint null -> NPE) at best, a freed one
+                // (SIGSEGV in libusbhost) at worst. Seen in the field as the
+                // drivers process dying right after every transmission.
+                var drained = 0
+                val deadline = System.currentTimeMillis() + DRAIN_BUDGET_MS
+                while (drained < rxRequests.size && System.currentTimeMillis() < deadline) {
+                    val done = try {
+                        conn.requestWait(DRAIN_WAIT_MS)
+                    } catch (_: TimeoutException) {
+                        continue
+                    } catch (_: Exception) {
+                        break
+                    } ?: break
+                    if (rxRequests.contains(done)) drained++
+                }
+                rxRequests.forEach { it.close() }
                 rxRequests.clear()
             }
         }
